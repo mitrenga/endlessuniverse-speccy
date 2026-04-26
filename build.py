@@ -39,6 +39,13 @@ def tape_header(block_type, filename, length, param1=0, param2=0x8000):
 def tzx_std(data, pause_ms=1000):
     return bytes([0x10]) + struct.pack('<H', pause_ms) + struct.pack('<H', len(data)) + data
 
+def tzx_pure_tone(pulse_len_T, count):
+    """TZX block 0x12: emit `count` pulses, each `pulse_len_T` T-states.
+    Used to extend the pilot tone before a standard-speed block: the
+    block emits no pause after, so its pulses merge seamlessly with
+    the pilot of the next 0x10 block."""
+    return bytes([0x12]) + struct.pack('<H', pulse_len_T) + struct.pack('<H', count)
+
 def num(n):
     return bytes([0x0E,0x00,0x00,n&0xFF,(n>>8)&0xFF,0x00])
 
@@ -120,59 +127,75 @@ ZX_TOKENS = {
 }
 _SORTED_TOKENS = sorted(ZX_TOKENS.items(), key=lambda x: -len(x[0]))
 
-def parse_basic_file(path):
-    """Parse text ZX BASIC source into bytecode"""
+def parse_basic_text(text):
+    """Parse text ZX BASIC source into tokenised bytecode."""
     lines = []
-    with open(path) as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw or raw.startswith('#'):
-                continue
-            parts = raw.split(None, 1)
-            linenum = int(parts[0])
-            rest = parts[1] if len(parts) > 1 else ''
-            content = bytearray()
-            i = 0
-            while i < len(rest):
-                if rest[i] == ' ':
-                    i += 1
-                    continue
-                if rest[i] == '"':
-                    j = rest.find('"', i + 1)
-                    j = j if j != -1 else len(rest) - 1
-                    content += rest[i:j+1].encode('ascii')
-                    i = j + 1
-                    continue
-                matched = False
-                for kw, token in _SORTED_TOKENS:
-                    if rest[i:i+len(kw)].upper() == kw:
-                        content.append(token)
-                        i += len(kw)
-                        matched = True
-                        break
-                if matched:
-                    continue
-                if rest[i].isdigit() or (rest[i] == '.' and i+1 < len(rest) and rest[i+1].isdigit()):
-                    j = i
-                    has_dot = False
-                    while j < len(rest):
-                        if rest[j].isdigit():
-                            j += 1
-                        elif rest[j] == '.' and not has_dot:
-                            has_dot = True
-                            j += 1
-                        else:
-                            break
-                    text = rest[i:j]
-                    content += text.encode('ascii')
-                    content += zx_float(float(text)) if has_dot else num(int(text))
-                    i = j
-                    continue
-                content += rest[i:i+1].encode('ascii')
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw or raw.startswith('#'):
+            continue
+        parts = raw.split(None, 1)
+        linenum = int(parts[0])
+        rest = parts[1] if len(parts) > 1 else ''
+        content = bytearray()
+        i = 0
+        while i < len(rest):
+            if rest[i] == ' ':
                 i += 1
-            content.append(0x0D)
-            lines.append(struct.pack('>H', linenum) + struct.pack('<H', len(content)) + bytes(content))
+                continue
+            if rest[i] == '"':
+                j = rest.find('"', i + 1)
+                j = j if j != -1 else len(rest) - 1
+                content += rest[i:j+1].encode('ascii')
+                i = j + 1
+                continue
+            matched = False
+            for kw, token in _SORTED_TOKENS:
+                if rest[i:i+len(kw)].upper() == kw:
+                    content.append(token)
+                    i += len(kw)
+                    matched = True
+                    break
+            if matched:
+                continue
+            if rest[i].isdigit() or (rest[i] == '.' and i+1 < len(rest) and rest[i+1].isdigit()):
+                j = i
+                has_dot = False
+                while j < len(rest):
+                    if rest[j].isdigit():
+                        j += 1
+                    elif rest[j] == '.' and not has_dot:
+                        has_dot = True
+                        j += 1
+                    else:
+                        break
+                text_n = rest[i:j]
+                content += text_n.encode('ascii')
+                content += zx_float(float(text_n)) if has_dot else num(int(text_n))
+                i = j
+                continue
+            content += rest[i:i+1].encode('ascii')
+            i += 1
+        content.append(0x0D)
+        lines.append(struct.pack('>H', linenum) + struct.pack('<H', len(content)) + bytes(content))
     return b''.join(lines)
+
+def parse_basic_file(path):
+    with open(path) as f:
+        return parse_basic_text(f.read())
+
+def basic_rem_line(line_num, raw):
+    """Build a tokenised REM line whose body is `raw` bytes verbatim.
+    BASIC navigates lines via the length field, so any byte (0x0D, 0x0E,
+    tokens) is safe inside a REM — it's only ever skipped past.
+
+    LIST is a different story: it streams the body through the PRINT
+    routine, so embedded bytes 0x10..0x17 (INK/PAPER/AT/...) consume
+    parameter bytes and can raise "Out of screen" mid-listing. Use
+    line 0 for the line number — `LIST` (no args) starts at line 1
+    and skips line 0, so the REM is invisible in normal listings."""
+    body = bytes([0xEA]) + raw + bytes([0x0D])
+    return struct.pack('>H', line_num) + struct.pack('<H', len(body)) + body
 
 # ── Assembler ─────────────────────────────────────────────────────────────────
 def assemble(src, dst):
@@ -272,61 +295,48 @@ def convert_image(image_path):
 ANIM_ORG  = 0xC200
 TABLE_ORG = 0xC800
 
-def build_tzx(stub_bin, anim_bin, screen_data, basic, output_path):
-    """Assemble the BASIC + stub + (image+anim) blocks into a single TZX file.
-
-    The stub loads at 0xC000, builds the address table at TABLE_ORG, then
-    runs SMLOADER on a single tape data block whose first `load_len` bytes
-    reveal into VRAM (image) and whose remaining bytes land at ANIM_ORG..
-    (animation/typewriter code). After SMLOADER, the stub jumps to ANIM_ORG.
+def patch_stub(stub_bin, load_len, anim_len):
+    """Patch the three placeholders inside stub.bin's START routine:
+        [0x08-0x09] LD HL, TABLE+2*load_len  — table offset where anim entries begin
+        [0x0E-0x0F] LD BC, anim_len           — count for the table append loop
+        [0x1F-0x20] LD DE, load_len+anim_len  — total tape byte count for SMLOADER
     """
-    # Reorder VRAM bytes to match the Z80 GEN_TABLE sequence.
-    ordered = order_vram_payload(screen_data, build_addr_table())
-    # Drop top 8 strips (text overlay area) + strips 8/9 (empty band).
-    ordered = ordered[:14 * 288]
-    # Trim trailing zeros (loader pre-clears VRAM via the gap-clear in anim).
-    trimmed = ordered.rstrip(b'\x00')
-    load_len = len(trimmed)
-    anim_len = len(anim_bin)
-
-    # Stub size sanity: must fit below ANIM_ORG, anim must fit below TABLE_ORG.
-    assert 0xC000 + len(stub_bin) <= ANIM_ORG, \
-        f"stub.bin {len(stub_bin)} B overflows ANIM_ORG=0x{ANIM_ORG:04X}"
-    assert ANIM_ORG + anim_len <= TABLE_ORG, \
-        f"anim.bin {anim_len} B overflows TABLE_ORG=0x{TABLE_ORG:04X}"
-
-    # Patch the three placeholders in the stub:
-    #   0x07-0x09: LD HL, TABLE+2*load_len   (where to start writing anim entries)
-    #   0x0D-0x0F: LD BC, anim_len            (count for the append loop)
-    #   0x1E-0x20: LD DE, load_len+anim_len   (total tape byte count)
     assert stub_bin[0x07] == 0x21, "stub LD HL offset shifted — stub.asm changed?"
     assert stub_bin[0x0D] == 0x01, "stub LD BC offset shifted — stub.asm changed?"
     assert stub_bin[0x1E] == 0x11, "stub LD DE offset shifted — stub.asm changed?"
     hl_val    = TABLE_ORG + 2 * load_len
     total_len = load_len + anim_len
-    patched = bytearray(stub_bin)
-    patched[0x08] = hl_val   & 0xFF
-    patched[0x09] = (hl_val   >> 8) & 0xFF
-    patched[0x0E] = anim_len & 0xFF
-    patched[0x0F] = (anim_len >> 8) & 0xFF
-    patched[0x1F] = total_len & 0xFF
-    patched[0x20] = (total_len >> 8) & 0xFF
+    p = bytearray(stub_bin)
+    p[0x08] = hl_val    & 0xFF
+    p[0x09] = (hl_val    >> 8) & 0xFF
+    p[0x0E] = anim_len  & 0xFF
+    p[0x0F] = (anim_len  >> 8) & 0xFF
+    p[0x1F] = total_len & 0xFF
+    p[0x20] = (total_len >> 8) & 0xFF
+    return bytes(p)
 
-    payload = trimmed + anim_bin
+def build_image_payload(screen_data):
+    """Reorder VRAM bytes per GEN_TABLE, drop top 10 strips, trim trailing zeros."""
+    ordered = order_vram_payload(screen_data, build_addr_table())
+    ordered = ordered[:14 * 288]
+    return ordered.rstrip(b'\x00')
 
+def build_tzx(basic, payload, output_path):
+    """TZX with one BASIC block (carrying the stub in REM line 0), then a
+    pure-tone block that extends the pilot, then the custom data block
+    (image + anim, consumed by stub's SMLOADER)."""
     tzx = b'ZXTape!\x1A' + bytes([1, 20])
     tzx += tzx_std(tape_header(0,'endless',len(basic),param1=10,param2=len(basic)), 1000)
-    tzx += tzx_std(tape_data(basic), 1000)
-    tzx += tzx_std(tape_header(3,'endless',len(patched),param1=0xC000), 1000)
-    tzx += tzx_std(tape_data(bytes(patched)), 1000)
+    # 2 s gap after BASIC, then ~5 s of extra pilot pulses. BASIC's POKE
+    # loop runs during the pilot — it doesn't matter that the pilot is
+    # already on tape, ROM only starts pilot detection when SMLOADER
+    # begins. Total pilot time = ~5 s extra + ~2 s standard = ~7 s.
+    tzx += tzx_std(tape_data(basic), 2000)
+    tzx += tzx_pure_tone(2168, 8064)
     tzx += tzx_std(tape_data(payload), 2000)
 
     with open(output_path, 'wb') as f:
         f.write(tzx)
-    saved = 6912 - load_len
-    print(f"  Image:   {load_len} B ({saved} trailing zeros stripped)")
-    print(f"  Anim:    {anim_len} B (loaded silently to 0x{ANIM_ORG:04X})")
-    print(f"  Payload: {len(payload)} B (image + anim, single tape block)")
     print(f"  TZX:     {output_path} ({len(tzx)} bytes)")
 
 # ── WAV generator (physical Spectrum tape audio) ──────────────────────────────
@@ -359,6 +369,14 @@ def tzx_to_wav(tzx_data, wav_path, sample_rate=44100):
     pos = 10  # skip 'ZXTape!\x1A' + 2-byte version field
     while pos < len(tzx_data):
         bt = tzx_data[pos]
+        if bt == 0x12:
+            # Pure tone: emit count pulses of pulse_len_T, no pause
+            pulse_len_T = tzx_data[pos+1] | (tzx_data[pos+2] << 8)
+            pulse_count = tzx_data[pos+3] | (tzx_data[pos+4] << 8)
+            pos += 5
+            for _ in range(pulse_count):
+                pulse(pulse_len_T)
+            continue
         if bt != 0x10:
             raise ValueError(f'Unsupported TZX block 0x{bt:02x} at {pos}')
         p_ms   = tzx_data[pos+1] | (tzx_data[pos+2] << 8)
@@ -416,19 +434,46 @@ def main():
     assemble(anim_asm, anim_bin_path)
     anim_bin = open(anim_bin_path, 'rb').read()
 
-    # 2. Parse BASIC
-    bas_src = os.path.join(SRC_DIR, 'loader.bas')
-    print("\n[2] Parsing BASIC...")
-    basic = parse_basic_file(bas_src)
-    print(f"  BASIC: {bas_src.split('/')[-1]}, {len(basic)} bytes")
-
-    # 3. Convert image
-    print("\n[3] Converting image...")
+    # 2. Convert image (need its size before building BASIC, so we can
+    #    patch the stub with the actual image+anim total byte count)
+    print("\n[2] Converting image...")
     screen_data = convert_image(args.image)
+    image = build_image_payload(screen_data)
+    load_len = len(image)
+    anim_len = len(anim_bin)
 
-    # 4. Build TZX
+    # 3. Patch stub & sanity-check memory layout
+    assert 0xC000 + len(stub_bin) <= ANIM_ORG, \
+        f"stub.bin {len(stub_bin)} B overflows ANIM_ORG=0x{ANIM_ORG:04X}"
+    assert ANIM_ORG + anim_len <= TABLE_ORG, \
+        f"anim.bin {anim_len} B overflows TABLE_ORG=0x{TABLE_ORG:04X}"
+    patched_stub = patch_stub(stub_bin, load_len, anim_len)
+
+    # 4. Build BASIC: line 1 = REM with stub bytes verbatim, then the
+    #    user-authored loader.bas (PRINT/BEEP), then the POKE loop that
+    #    copies the REM body into 0xC000 and JPs to it.
+    bas_src = os.path.join(SRC_DIR, 'loader.bas')
+    print("\n[3] Tokenising BASIC...")
+    poke_src = (
+        f"90 LET s=PEEK 23635+256*PEEK 23636+5\n"
+        f"95 FOR i=0 TO {len(patched_stub) - 1}: POKE 49152+i,PEEK (s+i): NEXT i\n"
+        f"100 RANDOMIZE USR 49152\n"
+    )
+    # Line 0 hides the REM from `LIST` (which defaults to listing from
+    # line 1). Without this, embedded 0x16/0x10/... bytes inside the
+    # raw stub would crash LIST when ROM streams them through PRINT.
+    basic = (basic_rem_line(0, patched_stub)
+             + parse_basic_file(bas_src)
+             + parse_basic_text(poke_src))
+    print(f"  BASIC: {len(basic)} B (incl. {len(patched_stub)} B stub embedded in REM line 0)")
+
+    # 5. Build TZX
     print("\n[4] Building TZX...")
-    build_tzx(stub_bin, anim_bin, screen_data, basic, args.output)
+    payload = image + anim_bin
+    print(f"  Image:   {load_len} B ({6912 - load_len} trailing zeros stripped)")
+    print(f"  Anim:    {anim_len} B (loaded silently to 0x{ANIM_ORG:04X})")
+    print(f"  Payload: {len(payload)} B (image + anim, single tape block)")
+    build_tzx(basic, payload, args.output)
 
     # 5. Generate WAV for physical Spectrum
     print("\n[5] Generating WAV for physical Spectrum...")

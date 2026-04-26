@@ -70,9 +70,9 @@ python build.py --output /path/to/endless.tzx
 
 The build prints the size of every stage:
 ```
-[1] Assembling loader...
-[2] Parsing BASIC...
-[3] Converting image...
+[1] Assembling stub + anim...
+[2] Converting image...
+[3] Tokenising BASIC...
 [4] Building TZX...
 [5] Generating WAV for physical Spectrum...
 ```
@@ -94,40 +94,50 @@ The build prints the size of every stage:
 ```
 endless_project/
 ├── README.md
-├── CLAUDE.md            ← project notes for Claude Code
-├── VRAM_LOADER_TASK.md  ← spec for the runtime address-table approach
-├── build.py             ← top-level builder
+├── CLAUDE.md            ← project notes (deeper architecture detail)
+├── build.py             ← top-level builder (TZX + WAV)
 ├── src/
-│   ├── code.asm         ← Z80 source
-│   ├── loader.bas       ← BASIC bootstrap
-│   └── screen.png       ← source image (256 × 192 after resize)
+│   ├── stub.asm         ← Z80, ORG 0xC000, the tape loader (≤512 B)
+│   ├── anim.asm         ← Z80, ORG 0xC200, typewriter + meteor + star
+│   ├── loader.bas       ← user-edited PRINT/BEEP lines
+│   └── screen.png       ← source image (resized to 256 × 192)
 └── build/
-    ├── code.bin         ← assembled loader
+    ├── stub.bin         ← assembled tape loader
+    ├── anim.bin         ← assembled animation/typewriter/data
     ├── endless.tzx      ← TZX for emulators
     └── endless.wav      ← WAV for real hardware
 ```
 
 ## Technical notes
 
-### BASIC bootstrap (`src/loader.bas`)
-```
-10 CLEAR 49151
-20 BORDER 0: PAPER 0: INK 0: CLS
-30 LOAD "" CODE
-40 RANDOMIZE USR 49152
-```
+### Two-stage loader
+The Z80 code is split in two:
+- **stub** (~300 B at 0xC000) — table generator + tape reader.
+- **anim** (~1.2 kB at 0xC200) — typewriter + meteor/star animation + data.
 
-### Loader binary (`src/code.asm`)
-- ORG `0xC000` (49152)
-- Assembled binary is ~1.4 kB (code, sprites, state, message, tables).
-- An additional 13.5 kB runtime address table lives just past the
-  code, filled by `GEN_TABLE` at boot — it never travels on tape.
+`build.py` embeds the patched stub bytes verbatim into a hidden
+**REM line 0** of the BASIC program. BASIC POKEs those bytes from the
+REM body (via `PROG+5`) into 0xC000, then `RANDOMIZE USR 49152` jumps
+to it. The stub's custom SMLOADER then reads the **single** custom
+data block on tape, which carries both the image (visible bottom-up
+reveal) and the anim binary (silently lands at 0xC200).
+
+The runtime address table that drives the per-byte routing lives at
+0xC800..0xFE00 (13.5 kB), built by `GEN_TABLE`. It never travels on
+tape and is overwritten with anim destinations for the second half.
+
+### BASIC bootstrap (`src/loader.bas`)
+The on-disk source has only the visible parts (PRINT/BEEP). `build.py`
+prepends a `REM` line 0 with the stub bytes and appends the POKE+USR
+loop. See `CLAUDE.md` for the full tokenised listing.
 
 ### Tape blocks (in order)
-1. BASIC header + program
-2. Code header + the loader binary
-3. Screen payload — only strips 23..10 (rows 10..23) reordered per
-   the GEN_TABLE sequence, with trailing zeros trimmed off.
+1. BASIC header
+2. BASIC data (carries the embedded stub in REM line 0), 2 s pause after.
+3. Pure tone (TZX 0x12) — ~5 s of extra pilot pulses, gives BASIC's
+   POKE loop time to copy the stub into 0xC000 before SMLOADER starts.
+4. Custom data block — image bytes (bottom-up reveal) followed by the
+   anim binary (silent RAM load), consumed by the stub's SMLOADER.
 
 ### ZX VRAM addressing (recap)
 - Pixels: `0x4000..0x57FF` (6144 B, scrambled by bank / scan)

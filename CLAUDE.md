@@ -44,24 +44,43 @@ visible reveal) or RAM at `ANIM_ORG` (anim code, silent).
 
 ### Memory layout (above RAMTOP=0xBFFF, set by BASIC `CLEAR 49151`)
 ```
-0xC000..0xC129   stub.bin     (298 B,  loaded by BASIC `LOAD "" CODE`)
+0xC000..0xC129   stub.bin     (298 B,  POKEd from REM body by BASIC)
 0xC200..0xC686   anim.bin     (1159 B, ANIM_ORG; loaded via SMLOADER)
 0xC800..0xFE00   TABLE        (13824 B, built at runtime by GEN_TABLE)
 ```
 Sizes shown are current. Stub must stay ≤512 B (below 0xC200), anim
 must stay ≤1536 B (below 0xC800). `build.py` asserts both bounds.
 
-### BASIC bootstrap (`src/loader.bas`)
+### BASIC bootstrap (`src/loader.bas` + build-time injections)
+The author-edited source has only the visible parts (PRINT/BEEP);
+`build.py` prepends a REM line containing the stub bytes verbatim
+and appends the POKE+USR lines. The full tokenised program is:
 ```
-10 CLEAR 49151
-20 BORDER 0: PAPER 0: INK 4: BRIGHT 1: CLS
-22..28 PRINT AT … "ENDLESS UNIVERSE IS LOADING…"
-29 FOR a=0 TO 12 STEP 2: BEEP .1,a: NEXT a
-30 LOAD "" CODE
-40 RANDOMIZE USR 49152
+0   REM <298 raw stub bytes>            ← prepended by build.py
+10  CLEAR 49151
+20  BORDER 0: PAPER 0: INK 4: BRIGHT 1: CLS
+30..60  PRINT AT … "ENDLESS UNIVERSE IS LOADING…"
+70  INK 0
+80  FOR a=0 TO 12 STEP 2: BEEP .1,a: NEXT a
+90  LET s=PEEK 23635+256*PEEK 23636+5    ← appended by build.py
+95  FOR i=0 TO <stub_size-1>: POKE 49152+i,PEEK (s+i): NEXT i
+100 RANDOMIZE USR 49152
 ```
-The PRINT lines are visible during the BASIC LOAD CODE phase and get
-wiped (invisibly, via the attr-hide trick) by anim's startup code.
+The PRINT lines are visible during BASIC LOAD and the POKE phase;
+they get wiped (invisibly, via the attr-hide trick) by anim startup.
+
+`PEEK 23635 + 256*PEEK 23636` reads system variable `PROG` (start
+of BASIC program in memory); `+5` skips the line 0 header
+(2 B line# + 2 B length + 1 B REM token), pointing at the first stub
+byte. The POKE loop copies the stub into 0xC000 (~3 s of BASIC
+execution time), then `RANDOMIZE USR 49152` jumps to it.
+
+### REM-on-line-0 trick
+The stub bytes embedded in the REM contain control codes
+(0x10/0x16/…) that crash `LIST` because ROM streams the body through
+the PRINT routine. Putting the REM at line 0 hides it from `LIST`
+without args (which starts at line 1). `LIST 0` would still error;
+this is the same compromise commercial 80s tape loaders accepted.
 
 ### Stub (`src/stub.asm`, ORG 0xC000)
 Boot sequence inside `START`:
@@ -97,7 +116,17 @@ Entry point `ANIM_START`:
 7. Falls into `MAIN_ANIM`: per-frame cursor blink + meteor step
    (6 meteors) + star step (3 twinkling stars).
 
-### Tape payload format
+### Tape structure (TZX blocks)
+1. **BASIC header** (0x10, ~5 s pilot)
+2. **BASIC data** (0x10, ~2 s pilot, then ~720 B incl. embedded stub),
+   **2 s pause** after.
+3. **Pure tone** (0x12, 8064 pulses × 2168 T-states = ~5 s extra pilot
+   merged into the next block's pilot — this is the "BASIC POKE budget".
+   The total pilot the SMLOADER sees before sync is ~7 s).
+4. **Custom data block** (0x10, image+anim payload, ~2 s pilot + data),
+   read by stub's SMLOADER, **not** by ROM LOAD.
+
+### Image+anim payload format
 Only the bottom 14 strips (char rows 10..23) of the screen travel on
 tape, reordered to match `GEN_TABLE`'s bottom-up sequence and with
 trailing zeros trimmed (the wipe at `ANIM_START` blanks any remaining
@@ -126,12 +155,25 @@ never spawn on top of image content.
 
 ## BASIC tokenizer notes (`build.py`)
 
-`parse_basic_file` tokenizes ZX BASIC source to bytecode. It handles:
+`parse_basic_text` tokenizes ZX BASIC source to bytecode (and
+`parse_basic_file` is a thin wrapper that reads from disk first).
+It handles:
 - Reserved words via `ZX_TOKENS` (longest-prefix match).
 - Strings (verbatim ASCII).
 - Integer literals → text + `0x0E` + 5-byte short-form value (`num`).
 - Float literals like `.1` or `0.5` → text + `0x0E` + 5-byte FP form
   (`zx_float`, normalises mantissa to [0.5, 1) and biases exponent by 0x80).
+
+`basic_rem_line(line_num, raw)` builds a tokenised REM line whose body
+is `raw` bytes verbatim; `build.py` calls it with `line_num=0` and the
+patched stub.
+
+## TZX builder notes (`build.py`)
+
+- `tzx_std(data, pause_ms)` → block 0x10 (standard speed).
+- `tzx_pure_tone(pulse_len_T, count)` → block 0x12 (just N equal-length
+  pulses, no pause after — used to extend the pilot of the next block).
+- `tzx_to_wav` understands both 0x10 and 0x12 blocks.
 
 ## Testing
 
@@ -149,12 +191,16 @@ not when an emulator snapshot-loads CODE blocks instantly.
   `apt install z80asm`.
 - `ModuleNotFoundError: PIL` → `pip install Pillow`.
 - Image not visible → confirm `src/screen.png` exists in `src/`.
-- `stub.bin overflows ANIM_ORG` → stub grew past 512 B; either shrink
-  the loader or move `ANIM_ORG` upward (and update `build.py`'s
-  literal in `stub.asm`).
-- `anim.bin overflows TABLE_ORG` → anim grew past 1536 B; shrink it
-  or move `TABLE_ORG` upward (the runtime table needs 13824 B above
-  `TABLE_ORG`, so don't push it past `0xCA00`).
+- `stub.bin overflows ANIM_ORG` → stub grew past 512 B. Either shrink
+  the loader or raise `ANIM_ORG`. The constant lives in **two** places
+  that must agree: the Python constant in `build.py` and the hardcoded
+  `0xC200` literal(s) in `stub.asm` (the `LD DE, 0xC200` and
+  `JP 0xC200` instructions). Bump both.
+- `anim.bin overflows TABLE_ORG` → anim grew past 1536 B. Same dual-source
+  fix as above for `TABLE_ORG` (the `LD DE, 0xC800` / `LD HL, 0xC800` /
+  `LD IX, 0xC800` literals in `stub.asm` plus the Python constant in
+  `build.py`). The runtime table needs 13824 B above `TABLE_ORG`, so
+  don't push it past `0xCA00`.
 - `LD HL/BC/DE offset shifted` assertion → the START code in
   `stub.asm` was edited and the patchable instructions moved;
   recompute the offsets and update the asserts in `build.py`.
