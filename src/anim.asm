@@ -1,10 +1,10 @@
 ; ============================================================
 ; endless — animation, typewriter, and data
 ;
-; Loaded silently at 0xC200 by the SMLOADER in stub.bin (image
-; bytes reveal first into VRAM, then anim bytes land in RAM at
-; the tail of the same tape block). The stub jumps to ANIM_START
-; once the load completes.
+; Loaded silently at 0xC200 by LD_BYTES in stub.bin (image bytes
+; reveal first into VRAM, then anim bytes land in RAM at the tail
+; of the same tape block). The stub jumps to ANIM_START once the
+; load completes successfully.
 ; ============================================================
 
     ORG     0xC200

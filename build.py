@@ -299,7 +299,7 @@ def patch_stub(stub_bin, load_len, anim_len):
     """Patch the three placeholders inside stub.bin's START routine:
         [0x08-0x09] LD HL, TABLE+2*load_len  — table offset where anim entries begin
         [0x0E-0x0F] LD BC, anim_len           — count for the table append loop
-        [0x1F-0x20] LD DE, load_len+anim_len  — total tape byte count for SMLOADER
+        [0x1F-0x20] LD DE, load_len+anim_len  — total tape byte count for LD_BYTES
     """
     assert stub_bin[0x07] == 0x21, "stub LD HL offset shifted — stub.asm changed?"
     assert stub_bin[0x0D] == 0x01, "stub LD BC offset shifted — stub.asm changed?"
@@ -324,12 +324,12 @@ def build_image_payload(screen_data):
 def build_tzx(basic, payload, output_path):
     """TZX with one BASIC block (carrying the stub in REM line 0), then a
     pure-tone block that extends the pilot, then the custom data block
-    (image + anim, consumed by stub's SMLOADER)."""
+    (image + anim, consumed by stub's LD_BYTES)."""
     tzx = b'ZXTape!\x1A' + bytes([1, 20])
     tzx += tzx_std(tape_header(0,'endless',len(basic),param1=10,param2=len(basic)), 1000)
     # 2 s gap after BASIC, then ~5 s of extra pilot pulses. BASIC's POKE
     # loop runs during the pilot — it doesn't matter that the pilot is
-    # already on tape, ROM only starts pilot detection when SMLOADER
+    # already on tape, ROM only starts pilot detection when LD_BYTES
     # begins. Total pilot time = ~5 s extra + ~2 s standard = ~7 s.
     tzx += tzx_std(tape_data(basic), 2000)
     tzx += tzx_pure_tone(2168, 8064)
@@ -343,10 +343,11 @@ def build_tzx(basic, payload, output_path):
 def tzx_to_wav(tzx_data, wav_path, sample_rate=44100):
     """
     Render the TZX as a WAV that a real ZX Spectrum can load through the
-    EAR input. Only the standard-speed block type (0x10, the only one
-    that build_tzx produces) is supported. Pulse durations follow the
-    ROM loader timing: pilot 2168T, sync 667/735T, bit 0 = 855T per
-    pulse, bit 1 = 1710T per pulse, two pulses per data bit.
+    EAR input. Supports the two block types build_tzx emits: 0x10
+    (standard-speed) and 0x12 (pure tone — N equal-length pulses, no
+    pause after, used to extend the pilot of the next block). Pulse
+    durations follow the ROM loader timing: pilot 2168T, sync 667/735T,
+    bit 0 = 855T per pulse, bit 1 = 1710T per pulse, two pulses per data bit.
     """
     import wave
     CPU_CLOCK = 3500000

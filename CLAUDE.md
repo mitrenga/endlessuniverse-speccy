@@ -37,15 +37,17 @@ and a one-line size report (stub / anim / payload / TZX).
 ## Architecture (two-stage loader)
 
 The intro is split into a tiny stub (loaded by BASIC) and a larger
-anim+data blob (loaded silently by the stub's custom SMLOADER as the
-tail of the same tape block that delivers the image). The address
-table `LOAD_BYTE` consults can route bytes anywhere — VRAM (image,
-visible reveal) or RAM at `ANIM_ORG` (anim code, silent).
+anim+data blob (loaded silently by the stub's `LD_BYTES` as the tail
+of the same tape block that delivers the image). `LD_BYTES` is a
+verbatim copy of ZX 48K ROM `LD-BYTES` (0x0556) with one modification:
+the byte-store inside the inner loop is replaced by a lookup through
+a runtime address table. That table can route each byte anywhere —
+VRAM (image, visible reveal) or RAM at `ANIM_ORG` (anim code, silent).
 
 ### Memory layout (above RAMTOP=0xBFFF, set by BASIC `CLEAR 49151`)
 ```
-0xC000..0xC129   stub.bin     (298 B,  POKEd from REM body by BASIC)
-0xC200..0xC686   anim.bin     (1159 B, ANIM_ORG; loaded via SMLOADER)
+0xC000..0xC13E   stub.bin     (319 B,  POKEd from REM body by BASIC)
+0xC200..0xC686   anim.bin     (1159 B, ANIM_ORG; loaded via LD_BYTES)
 0xC800..0xFE00   TABLE        (13824 B, built at runtime by GEN_TABLE)
 ```
 Sizes shown are current. Stub must stay ≤512 B (below 0xC200), anim
@@ -56,7 +58,7 @@ The author-edited source has only the visible parts (PRINT/BEEP);
 `build.py` prepends a REM line containing the stub bytes verbatim
 and appends the POKE+USR lines. The full tokenised program is:
 ```
-0   REM <298 raw stub bytes>            ← prepended by build.py
+0   REM <319 raw stub bytes>            ← prepended by build.py
 10  CLEAR 49151
 20  BORDER 0: PAPER 0: INK 4: BRIGHT 1: CLS
 30..60  PRINT AT … "ENDLESS UNIVERSE IS LOADING…"
@@ -90,9 +92,12 @@ Boot sequence inside `START`:
 3. Append loop overwrites table entries from offset `2*image_size`
    onwards with sequential RAM addresses (`ANIM_ORG`..`ANIM_ORG+anim_size-1`),
    so the bytes following the image on tape route into RAM rather than VRAM.
-4. `SMLOADER` reads `image_size + anim_size` bytes from tape, routing
+4. `LD_BYTES` reads `image_size + anim_size` bytes from tape, routing
    each through the table.
-5. `EI`, then `JP ANIM_ORG` (= 0xC200, the start of anim.bin).
+5. On checksum mismatch (`CF = 0` after `LD_BYTES`), jump to
+   `LOAD_FAILED` — set border to red, `HALT` (signals load failure
+   without crashing into garbage anim code).
+6. Otherwise `EI`, then `JP ANIM_ORG` (= 0xC200, start of anim.bin).
 
 `build.py` patches three operands inside the stub:
 - `[0x08-0x09]` LD HL → `TABLE + 2*image_size`
@@ -101,6 +106,45 @@ Boot sequence inside `START`:
 
 (z80asm has no `EQU`, so the stub uses literal `0xC200` / `0xC800`
 where the constants would normally go.)
+
+### `LD_BYTES` (`src/stub.asm`)
+Verbatim copy of the ZX 48K ROM `LD-BYTES` routine (0x0556) with
+labels prefixed `LDB_…` / `LDE_…` to avoid collision. We can't just
+`CALL 0x0556` because ROM `LD-BYTES` writes each byte to a contiguous
+range starting at `IX`, but we need each byte routed via the table.
+The only modification is in `LDB_LOOP`: instead of
+`LD (IX+0), L; INC IX`, we read the destination address from
+`(IX+0)` / `(IX+1)`, write the byte there, and advance `IX` by 2.
+
+Everything else — pilot detection (`LDB_LEADER`), sync (`LDB_SYNC`),
+bit-by-bit decode (`LDB_8_BITS`), checksum check (`H == 0` at end) —
+is byte-for-byte ROM. `LD_EDGE_1` / `LD_EDGE_2` (0x05E7 / 0x05E3 in
+ROM) are also verbatim, including the 358T pre-delay, the 59T
+sample-loop iter, the SPACE-key break check, and the bit-5 EAR
+detection (`AND $20` after `RRA`). Matching ROM exactly means our
+thresholds (`0xC6`, `0xCB`, `0xD4`) sit in the same calibrated window
+as the original loader, so any signal that ROM tolerates we tolerate.
+
+Two cosmetic deviations from ROM:
+- `LD_BYTES` initialises C with `OR 0x07` (instead of ROM's `OR 0x02`).
+  That makes the bottom-3 colour bits flip between 7 and 0 across
+  successive `CPL`s in `LD_EDGE_1`, so the pilot-tone border blinks
+  white ↔ black instead of red ↔ cyan.
+- `LDB_8_BITS` does an extra `OUT (0xFE), A` once per decoded bit,
+  cycling a `BORDER_VAL` byte through the standard `ADD A, 3 ; AND 7`
+  sequence (also OR'd with the MIC bit). On top of `LD_EDGE_1`'s
+  per-edge white/black flicker that makes the data phase shimmer
+  through all 8 colours instead of staying just black/white. The
+  per-bit overhead (~80 T-states) is well within the bit-decode
+  threshold margin.
+
+The first byte received is the standard ROM flag byte (0xFF for a
+data block); `LDB_FLAG` consumes it without storing. The last byte
+received is the parity byte; after `LDB_LOOP` decrements `DE` to zero
+the routine reads one more byte purely to roll it into `H` for the
+final `CP $01` checksum gate. `H` is initialised to `0` explicitly
+right before `LDB_MARKER`, so the result doesn't depend on whatever
+junk `H` carried in from the caller.
 
 ### Anim (`src/anim.asm`, ORG 0xC200)
 Entry point `ANIM_START`:
@@ -122,16 +166,16 @@ Entry point `ANIM_START`:
    **2 s pause** after.
 3. **Pure tone** (0x12, 8064 pulses × 2168 T-states = ~5 s extra pilot
    merged into the next block's pilot — this is the "BASIC POKE budget".
-   The total pilot the SMLOADER sees before sync is ~7 s).
+   The total pilot `LD_BYTES` sees before sync is ~7 s).
 4. **Custom data block** (0x10, image+anim payload, ~2 s pilot + data),
-   read by stub's SMLOADER, **not** by ROM LOAD.
+   read by stub's `LD_BYTES`, **not** by ROM LOAD.
 
 ### Image+anim payload format
 Only the bottom 14 strips (char rows 10..23) of the screen travel on
 tape, reordered to match `GEN_TABLE`'s bottom-up sequence and with
 trailing zeros trimmed (the wipe at `ANIM_START` blanks any remaining
 zero bytes). After the trimmed image bytes, `anim.bin` is appended
-verbatim — same tape data block, same checksum, same SMLOADER call.
+verbatim — same tape data block, same checksum, same `LD_BYTES` call.
 
 ### Animation layers
 - **Cursor** (`_`) blinks at `(CURR_ROW, CURR_COL)`, driven by FRAMES bit 4.
@@ -177,13 +221,26 @@ patched stub.
 
 ## Testing
 
-JSSpeccy 3: <https://jsspeccy.zxdemo.org/> — drop `build/endless.tzx`
-on the window. For real hardware, play `build/endless.wav` into the
-EAR input.
+- **JSSpeccy 3** (<https://jsspeccy.zxdemo.org/>) — drop `endless.tzx`
+  on the window. Easiest path, works out of the box.
+- **Fuse** — drop `endless.tzx`. **Must** turn off all three loader
+  shortcuts in *Options → Peripherals*: "Fast tape loading",
+  "Accelerate tape loaders", "Detect tape loaders". With any of them
+  on, Fuse's pattern-matcher misidentifies our in-RAM ROM-style loader
+  as a known speed loader and feeds bytes faster than the pilot tone
+  ends, so the custom block starts being read mid-pilot.
+- **Real hardware** — play `endless.wav` into the EAR input,
+  volume ~50–75 %, then `LOAD ""`. Fuse's WAV mode is finicky and
+  not a primary target; use TZX in Fuse instead.
 
 In emulators, **use tape loading mode** (the loader.bas hint says so):
-the bottom-up reveal effect only happens when SMLOADER actually runs,
+the bottom-up reveal effect only happens when `LD_BYTES` actually runs,
 not when an emulator snapshot-loads CODE blocks instantly.
+
+If the tape goes through but the screen ends up showing only a solid
+**red border + halt**, that's the `LOAD_FAILED` indicator — `LD_BYTES`
+returned `CF = 0` (checksum mismatch). Most likely cause: an emulator
+shortcut as above, or noisy real-HW signal.
 
 ## Common problems
 
@@ -210,3 +267,11 @@ not when an emulator snapshot-loads CODE blocks instantly.
   identified meteor pixel writes as the trigger, so the layers are
   kept strictly sequential (typewriter first, meteor + star animation
   only after `TW_END`).
+- Solid red border + halt after the tape stops → `LD_BYTES` returned
+  `CF = 0`, the parity byte didn't match (= corrupted load). On Fuse,
+  flip off "Fast tape loading" / "Accelerate tape loaders" / "Detect
+  tape loaders". On real HW, check tape volume / cable noise.
+- `R Tape loading error` mid-load (no red border, returns to BASIC) →
+  the *ROM* loader (i.e. the BASIC block, not our custom loader) gave
+  up. Same emulator-shortcut / signal-quality story applies, just one
+  block earlier on the tape.

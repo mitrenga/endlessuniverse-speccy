@@ -2,10 +2,12 @@
 
 A title-screen intro for the upcoming retro-style game **ENDLESS UNIVERSE**.
 To make the loading itself part of the show, the intro uses a custom
-tape loader specially modified so the picture reveals itself character
-row by character row from the bottom up — instead of the scrambled
-three-band fill of the ROM's standard loader (which writes VRAM in
-linear address order and so paints the screen in interleaved scans).
+tape loader: a verbatim copy of the ROM `LD-BYTES` routine with the
+inner byte-store replaced by a runtime-table lookup, so the picture
+reveals itself character row by character row from the bottom up
+instead of the scrambled three-band fill of the ROM's standard
+loader (which writes VRAM in linear address order and paints the
+screen in interleaved scans).
 
 Once the image is fully on screen, a typewriter prints a short
 in-universe blurb in the top band, and the scene then runs
@@ -52,6 +54,14 @@ sudo apt install z80asm
 
 ### Emulator (for testing)
 - [JSSpeccy 3](https://jsspeccy.zxdemo.org/) — runs in the browser, easiest
+- [Fuse](https://fuse-emulator.sourceforge.net/) — desktop, macOS / Linux.
+  Use the `.tzx` and in *Options → Peripherals* turn **"Fast tape loading" OFF**,
+  **"Accelerate tape loaders" OFF** and **"Detect tape loaders" OFF**.
+  Any of those three short-circuit the pulse-level emulation our in-RAM
+  ROM-style loader needs — with them on, the detector mistakes us for
+  a known speed loader and feeds bytes faster than the pilot ends, so
+  the custom block starts being read before the pilot tone finishes.
+- ZEsarUX, ZXSpin, etc.
 
 ## Build
 
@@ -110,15 +120,18 @@ endless_project/
 
 ### Two-stage loader
 The Z80 code is split in two:
-- **stub** (~300 B at 0xC000) — table generator + tape reader.
+- **stub** (~320 B at 0xC000) — table generator + tape reader.
 - **anim** (~1.2 kB at 0xC200) — typewriter + meteor/star animation + data.
 
 `build.py` embeds the patched stub bytes verbatim into a hidden
 **REM line 0** of the BASIC program. BASIC POKEs those bytes from the
 REM body (via `PROG+5`) into 0xC000, then `RANDOMIZE USR 49152` jumps
-to it. The stub's custom SMLOADER then reads the **single** custom
-data block on tape, which carries both the image (visible bottom-up
-reveal) and the anim binary (silently lands at 0xC200).
+to it. The stub's `LD_BYTES` (a faithful copy of ROM 0x0556 with
+table-routed byte store) then reads the **single** custom data block
+on tape, which carries both the image (visible bottom-up reveal)
+and the anim binary (silently lands at 0xC200). On checksum mismatch
+the stub jumps to `LOAD_FAILED`: red border + `HALT`, signalling load
+corruption rather than running into broken anim code.
 
 The runtime address table that drives the per-byte routing lives at
 0xC800..0xFE00 (13.5 kB), built by `GEN_TABLE`. It never travels on
@@ -133,9 +146,9 @@ loop. See `CLAUDE.md` for the full tokenised listing.
 1. BASIC header
 2. BASIC data (carries the embedded stub in REM line 0), 2 s pause after.
 3. Pure tone (TZX 0x12) — ~5 s of extra pilot pulses, gives BASIC's
-   POKE loop time to copy the stub into 0xC000 before SMLOADER starts.
+   POKE loop time to copy the stub into 0xC000 before `LD_BYTES` starts.
 4. Custom data block — image bytes (bottom-up reveal) followed by the
-   anim binary (silent RAM load), consumed by the stub's SMLOADER.
+   anim binary (silent RAM load), consumed by the stub's `LD_BYTES`.
 
 ### ZX VRAM addressing (recap)
 - Pixels: `0x4000..0x57FF` (6144 B, scrambled by bank / scan)
@@ -155,4 +168,6 @@ loop. See `CLAUDE.md` for the full tokenised listing.
 | `z80asm: command not found` | Install via `brew` / `apt` |
 | `ModuleNotFoundError: PIL` | `pip install Pillow` |
 | Image doesn't appear | Confirm `src/screen.png` exists and is readable |
+| Solid red border + halt after load | `LD_BYTES` checksum failed — flip off Fuse loader shortcuts (see Emulator section) or check tape volume / cable on real HW |
+| `R Tape loading error` mid-load | The *ROM* loader (BASIC block) gave up — same shortcut/signal story, just one block earlier |
 | `Invalid colour` after typing | Reverted layout — keep typewriter and meteor animation sequential (see CLAUDE.md) |

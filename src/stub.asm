@@ -4,16 +4,18 @@
 ; Memory layout:
 ;   0xC000..0xC1FF : this stub (≤512 B reserved)
 ;   0xC200..       : animation/typewriter code (loaded silently
-;                    by SMLOADER as the tail of the tape block,
+;                    by LD_BYTES as the tail of the tape block,
 ;                    after the 14-strip image data has revealed)
 ;   0xC800..0xFE00 : runtime address table (built by GEN_TABLE)
 ;   Stack          : below RAMTOP=0xBFFF (BASIC `CLEAR 49151`)
 ;
 ; Boot flow:
-;   1. BASIC `LOAD "" CODE`        → loads this stub at 0xC000
+;   1. BASIC POKEs this stub from REM line 0 into 0xC000
 ;   2. BASIC `RANDOMIZE USR 49152` → jumps to START
 ;   3. START builds the table, appends RAM destinations for the
-;      animation tail, runs SMLOADER, then JP ANIM_ORG.
+;      animation tail, runs LD_BYTES, then either JP ANIM_ORG (on
+;      successful load) or LOAD_FAILED (red border + HALT, on
+;      checksum mismatch).
 ; ============================================================
 
     ORG     0xC000
@@ -33,9 +35,8 @@ START:
 
     ; Append RAM destinations (sequential addresses ANIM_ORG..)
     ; for the animation bytes that follow the image on tape.
-    ; HL operand = TABLE + 2*image_size (offset into table where
-    ; the image entries end), BC operand = anim_size — both are
-    ; patched by build.py.
+    ; HL operand = TABLE + 2*image_size, BC operand = anim_size —
+    ; both are patched by build.py.
     LD      HL, 0xC800          ; TABLE + 2*image_size, patched
     LD      DE, 0xC200          ; ANIM_ORG
     LD      BC, 0               ; anim_size, patched
@@ -50,154 +51,190 @@ APPEND_LOOP:
     OR      C
     JR      NZ, APPEND_LOOP
 
-    ; Run the modified ROM-style tape loader.
+    ; Run the ROM-style tape loader.
     ; DE operand = image_size + anim_size, patched by build.py.
     LD      IX, 0xC800          ; TABLE
     LD      DE, 0               ; total tape bytes, patched
     LD      A, 0xFF
     SCF
-    CALL    SMLOADER
+    CALL    LD_BYTES
+
+    JR      NC, LOAD_FAILED     ; checksum failure
 
     EI
-
     JP      0xC200              ; ANIM_ORG
 
+LOAD_FAILED:
+    LD      A, 2                ; red border = checksum failure
+    OUT     (0xFE), A
+    HALT
+
 ; ============================================================
-; SMLOADER — modified ROM-style tape loader.
-;   Loads DE bytes from tape, but instead of writing them to a
-;   contiguous range it pulls each destination address from the
-;   address table at IX (2 bytes per entry, little-endian).
+; LD_BYTES — copy of ZX Spectrum 48K ROM LD-BYTES (0x0556) with:
+;   * the byte-store modified to route through the address table
+;     at IX (2 B per entry, little-endian),
+;   * the C-init mask flipped from 0x02 to 0x07 so the pilot-tone
+;     border blinks white/black instead of red/cyan,
+;   * a per-bit ADD 3 / AND 7 colour cycle written to the border
+;     in LDB_8_BITS for the data-decode visual.
+;
+; Everything else (LD_EDGE_1 / LD_EDGE_2 timing, the 0xC6 / 0xCB /
+; 0xD4 thresholds, checksum gate, flag handling) is byte-for-byte ROM.
+;
+; Entry:
+;   AF' carries flag-byte info (set by `EX AF, AF'` below)
+;   IX  = pointer to address table
+;   DE  = number of data bytes (NOT counting flag/checksum)
+;   CF  = 1 (load mode)
+; Exit:
+;   CF  = 1 success, 0 failure
 ; ============================================================
-SMLOADER:
+LD_BYTES:
     INC     D
-    EX      AF, AF'
+    EX      AF, AF'             ; preserve flag info in AF'
     DEC     D
+
+    LD      A, 0x0F              ; white border, MIC off
+    OUT     (0xFE), A
+
     IN      A, (0xFE)
-    AND     0x40
-    LD      C, A
-    CP      A
-RET_ERR:
-    RET     NZ
-LOAD_START:
-    CALL    DETECT_EDGE
-    JR      NC, LOAD_START
-    LD      HL, 0x0415
-DLY:
-    DJNZ    DLY
+    RRA
+    AND     0x20
+    OR      0x07                 ; white border (CPL → black on every edge)
+    LD      C, A                 ; initial polarity sample
+    CP      A                    ; ZF=1
+LDB_RET_ERR:
+    RET     NZ                   ; not taken initially
+
+LDB_LOOK_H:
+    CALL    LD_EDGE_1
+    JR      NC, LDB_LOOK_H
+    LD      HL, 0x0415           ; ~1 ms settling delay
+LDB_DLY:
+    DJNZ    LDB_DLY
     DEC     HL
     LD      A, H
     OR      L
-    JR      NZ, DLY
-    CALL    DETECT_2E
-    JR      NC, RET_ERR
-LEAD_IN:
+    JR      NZ, LDB_DLY
+    CALL    LD_EDGE_2
+    JR      NC, LDB_LOOK_H
+
+LDB_LEADER:
     LD      B, 0x9C
-    CALL    DETECT_2E
-    JR      NC, RET_ERR
+    CALL    LD_EDGE_2
+    JR      NC, LDB_LOOK_H
     LD      A, 0xC6
     CP      B
-    JR      NC, LOAD_START
+    JR      NC, LDB_LOOK_H
     INC     H
-    JR      NZ, LEAD_IN
-SYNC1:
+    JR      NZ, LDB_LEADER
+
+LDB_SYNC:
     LD      B, 0xC9
-    CALL    DETECT_EDGE
-    JR      NC, RET_ERR
+    CALL    LD_EDGE_1
+    JR      NC, LDB_LOOK_H       ; timeout → restart pilot search
     LD      A, B
     CP      0xD4
-    JR      NC, SYNC1
-SYNC2:
-    CALL    DETECT_EDGE
+    JR      NC, LDB_SYNC
+    CALL    LD_EDGE_1            ; sync2 edge (B carries from sync1)
     RET     NC
-    LD      B, 0xB0
-    JR      PREP8
 
-LOAD_BYTE:
+    LD      A, C
+    XOR     0x03                 ; toggle MIC + border bits
+    LD      C, A
+    LD      H, 0x00              ; checksum init
+    LD      B, 0xB0
+    JR      LDB_MARKER
+
+LDB_LOOP:
     EX      AF, AF'
-    JR      NZ, TYPE_FLAG
+    JR      NZ, LDB_FLAG         ; first byte = flag, don't store
 
     ; --- Modified store: route this byte through the address table ---
-    PUSH    BC                  ; B=timer, C=EAR state (loader internals)
-    LD      C, (IX+0)
-    LD      B, (IX+1)
-    LD      A, L
-    LD      (BC), A
+    PUSH    BC                   ; save B (counter), C (polarity)
+    LD      C, (IX+0)            ; lo byte of destination from table
+    LD      B, (IX+1)            ; hi byte of destination
+    LD      A, L                 ; the just-decoded data byte
+    LD      (BC), A              ; write to VRAM/RAM
     POP     BC
+    INC     IX                   ; advance table pointer (2 B per entry)
     INC     IX
-    INC     IX
-
     DEC     DE
-    JR      SETUP
+    JR      LDB_NEXT
 
-TYPE_FLAG:
-    XOR     A
-SETUP:
-    EX      AF, AF'
+LDB_FLAG:
+    XOR     A                    ; A=0, ZF=1 (signals "flag byte handled")
+LDB_NEXT:
+    EX      AF, AF'              ; AF' now (0, ZF=1) for subsequent bytes
     LD      B, 0xB2
-PREP8:
-    LD      L, 1
-BIT_LOOP:
-    CALL    DETECT_2E
-    RET     NC
+LDB_MARKER:
+    LD      L, 1                 ; bit pattern sentinel
+LDB_8_BITS:
+    CALL    LD_EDGE_2
+    RET     NC                   ; timeout in mid-load
     LD      A, 0xCB
     CP      B
     RL      L
     LD      B, 0xB0
-    PUSH    AF
-    LD      A, (BORDER_COLOR)
-    ADD     A, 3
-    AND     7
+    PUSH    AF                   ; save CF (= bit just shifted in)
+    LD      A, (BORDER_VAL)      ; cycle border per bit on top of LD_EDGE_1's
+    ADD     A, 3                 ; white/black flicker — gives the data
+    AND     0x07                 ; phase a multi-colour shimmer
+    LD      (BORDER_VAL), A
+    OR      0x08                 ; preserve MIC bit during load
     OUT     (0xFE), A
-    LD      (BORDER_COLOR), A
     POP     AF
-    JR      NC, BIT_LOOP
+    JR      NC, LDB_8_BITS       ; loop until L's sentinel reaches CF
     LD      A, H
     XOR     L
-    LD      H, A
+    LD      H, A                 ; checksum update
     LD      A, D
     OR      E
-    JR      NZ, LOAD_BYTE
+    JR      NZ, LDB_LOOP         ; more bytes?
     LD      A, H
-    CP      1
+    CP      0x01                 ; H=0 → CF=1 (success)
     RET
 
-DETECT_2E:
-    CALL    DETECT_EDGE
+; ============================================================
+; LD_EDGE_2 / LD_EDGE_1 — verbatim copy of ZX Spectrum 48K ROM
+; LD-EDGE-2 (0x05E3) and LD-EDGE-1 (0x05E7).
+;
+; LD_EDGE_1 finds one signal edge within timeout (B counter).
+; LD_EDGE_2 finds two consecutive edges.
+;
+; Sample loop is 59 T-states per iter (matching ROM thresholds
+; exactly) and includes a SPACE-key break check that returns NC
+; if the user holds CAPS+SPACE during loading.
+; ============================================================
+LD_EDGE_2:
+    CALL    LD_EDGE_1
     RET     NC
 
-DETECT_EDGE:
-    LD      A, 24
-EDG_DLY:
+LD_EDGE_1:
+    LD      A, 0x16              ; pre-delay constant
+LDE_DELAY:
     DEC     A
-    JR      NZ, EDG_DLY
-    AND     A
+    JR      NZ, LDE_DELAY
+    AND     A                    ; clear CF
 
-SAMPLE:
+LDE_SAMPLE:
     INC     B
-    RET     Z
-    NOP
-    NOP
+    RET     Z                    ; B overflowed → timeout (NC)
+    LD      A, 0x7F              ; keyboard half-row B/N/M/Sym/Space
     IN      A, (0xFE)
+    RRA                          ; bit 0 (SPACE) → CF
+    RET     NC                   ; SPACE pressed → break (NC)
     XOR     C
-    AND     0x40
-    JR      Z, SAMPLE
-
+    AND     0x20                 ; bit 5 = EAR after RRA
+    JR      Z, LDE_SAMPLE
     LD      A, C
-    AND     A
-    LD      A, 0x07
-    JR      NZ, SET_BORDER
-    XOR     A
-SET_BORDER:
-    OUT     (0xFE), A
-
-    LD      A, C
-    CPL
+    CPL                          ; flip polarity
     LD      C, A
+    AND     0x07                 ; isolate border colour bits
+    OR      0x08                 ; OR with MIC bit (always set during load)
+    OUT     (0xFE), A            ; flicker border + MIC
     SCF
     RET
-
-BORDER_COLOR:
-    DEFB    0
 
 ; ============================================================
 ; GEN_TABLE — build the 6912 × 2 B address table at DE.
@@ -291,8 +328,11 @@ GT_PIXEL_X:
     DJNZ    GT_STRIP
     RET
 
-; GEN_TABLE temporaries (kept here so the whole stub is self-contained)
+; GEN_TABLE temporaries
 GT_STRIP_V: DEFB    0
 GT_LOBASE:  DEFB    0
+
+; LDB_8_BITS per-bit border cycle state
+BORDER_VAL: DEFB    0
 
     END     START
