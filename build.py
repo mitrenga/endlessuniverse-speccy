@@ -42,6 +42,30 @@ def tzx_std(data, pause_ms=1000):
 def num(n):
     return bytes([0x0E,0x00,0x00,n&0xFF,(n>>8)&0xFF,0x00])
 
+def zx_float(x):
+    """ZX 5-byte FP form for non-integer literals, prefixed with 0x0E."""
+    if x == 0:
+        return bytes([0x0E, 0, 0, 0, 0, 0])
+    sign = 0
+    if x < 0:
+        sign = 1
+        x = -x
+    e = 0
+    while x >= 1.0:
+        x /= 2
+        e += 1
+    while x < 0.5:
+        x *= 2
+        e -= 1
+    m = int(round(x * (1 << 32)))
+    if m == (1 << 32):
+        m = 1 << 31
+        e += 1
+    m = (m & 0x7FFFFFFF) | (sign << 31)
+    return bytes([0x0E, (e + 0x80) & 0xFF,
+                  (m >> 24) & 0xFF, (m >> 16) & 0xFF,
+                  (m >> 8) & 0xFF, m & 0xFF])
+
 def pxaddr(y):
     return 0x4000 | ((y&0xC0)<<5) | ((y&0x07)<<8) | ((y&0x38)<<2)
 
@@ -128,13 +152,20 @@ def parse_basic_file(path):
                         break
                 if matched:
                     continue
-                if rest[i].isdigit():
+                if rest[i].isdigit() or (rest[i] == '.' and i+1 < len(rest) and rest[i+1].isdigit()):
                     j = i
-                    while j < len(rest) and rest[j].isdigit():
-                        j += 1
-                    n = int(rest[i:j])
-                    content += rest[i:j].encode('ascii')
-                    content += num(n)
+                    has_dot = False
+                    while j < len(rest):
+                        if rest[j].isdigit():
+                            j += 1
+                        elif rest[j] == '.' and not has_dot:
+                            has_dot = True
+                            j += 1
+                        else:
+                            break
+                    text = rest[i:j]
+                    content += text.encode('ascii')
+                    content += zx_float(float(text)) if has_dot else num(int(text))
                     i = j
                     continue
                 content += rest[i:i+1].encode('ascii')
@@ -252,11 +283,11 @@ def build_tzx(loader_bin, screen_data, basic, output_path):
     load_len = len(trimmed)
 
     # Patch the loader's `LD DE, n` instruction with the actual payload
-    # length. Offset 0x18 is the opcode (0x11), 0x19..0x1A is the operand.
-    assert loader_bin[0x18] == 0x11, "LD DE offset mismatch — code.asm changed?"
+    # length. Offset 0x0B is the opcode (0x11), 0x0C..0x0D is the operand.
+    assert loader_bin[0x0B] == 0x11, "LD DE offset mismatch — code.asm changed?"
     patched = bytearray(loader_bin)
-    patched[0x19] = load_len & 0xFF
-    patched[0x1A] = (load_len >> 8) & 0xFF
+    patched[0x0C] = load_len & 0xFF
+    patched[0x0D] = (load_len >> 8) & 0xFF
 
     tzx = b'ZXTape!\x1A' + bytes([1, 20])
     tzx += tzx_std(tape_header(0,'endless',len(basic),param1=10,param2=len(basic)), 1000)
@@ -375,7 +406,7 @@ def main():
         tzx_data = f.read()
     tzx_to_wav(tzx_data, wav_path)
     size_kb = os.path.getsize(wav_path) / 1024
-    print(f"  WAV: {wav_path} ({size_kb:.1f} KB, 44100 Hz 16-bit mono)")
+    print(f"  WAV created: {wav_path} ({size_kb:.1f} KB, 44100 Hz 16-bit mono)")
 
     print(f"\n✓ Done! Load in JSSpeccy or real ZX Spectrum:")
     print(f"  LOAD \"\"")

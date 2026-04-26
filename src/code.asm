@@ -9,9 +9,10 @@
 ; Boot flow:
 ;   1. BASIC  `LOAD "" CODE` loads us at 0xC000
 ;   2. BASIC  `RANDOMIZE USR 49152` jumps to START
-;   3. START  pre-clears VRAM, builds the address table, runs SMLOADER
-;             (which writes each tape byte to the address pulled from the
-;             table, producing the bottom-up reveal effect)
+;   3. START  builds the address table, runs SMLOADER (which writes each
+;             tape byte to the address pulled from the table, producing
+;             the bottom-up reveal effect), then wipes pixel block 0
+;             (char rows 0..7) to clear the BASIC `PRINT` overlay
 ;   4. After loading, fill in attributes for the top 10 char rows
 ;             (rows 0..9 — not present in the tape payload)
 ;   5. Run TYPEWRITER to print MSG with a blinking cursor and clicks
@@ -25,13 +26,6 @@
 ; ============================================================
 START:
     DI
-
-    ; Clear pixel area 0x4000..0x57FF (6144 bytes) to 0
-    LD      HL, 0x4000
-    LD      DE, 0x4001
-    LD      BC, 0x17FF
-    LD      (HL), 0
-    LDIR
 
     ; Generate the 6912 x 2 B address table just past the code
     LD      DE, TABLE
@@ -47,22 +41,60 @@ START:
 
     EI
 
-    ; Fill attributes for the top 10 char rows (0x5800..0x593F)
-    ; with 0x44 = BRIGHT | INK_GREEN, PAPER_BLACK.
-    ;   Rows 0..7 : text overlay area
-    ;   Rows 8..9 : empty band above the image (strips 8/9 are skipped
-    ;               by the build, so their attr bytes never arrive)
-    LD      HL, 0x5800
-    LD      DE, 0x5801
-    LD      BC, 0x13F
-    LD      (HL), 0x44
+    ; Hide rows 0..9 by setting attributes to 0x00 (INK=PAPER=BLACK)
+    ; so the BASIC `PRINT` text and the pixel wipe are both invisible.
+    LD      A, 0x00
+    CALL    FILL_TOP_ATTR
+
+    ; Wipe pixel block 0 (0x4000..0x47FF, char rows 0..7) — clears
+    ; leftovers from the BASIC `PRINT` lines while preserving the
+    ; freshly-loaded image in blocks 1 and 2.
+    LD      HL, 0x4000
+    LD      DE, 0x4001
+    LD      BC, 0x07FF
+    LD      (HL), 0
     LDIR
 
-    ; ATTR_T = 0x44 so RST 0x10 prints text in bright green on black
+    ; Wipe char rows 8..9 (the empty band above the image). Their
+    ; pixels live in block 1 interleaved with rows 10..15, so we
+    ; can't LDIR-clear them in one shot. Each iteration clears 64 B
+    ; at 0x4800 + x*0x100 (rows 8..9 share a single scanline slot).
+    LD      HL, 0x4800
+    LD      B, 8
+GAP_CLEAR:
+    PUSH    BC
+    LD      D, H
+    LD      E, L
+    INC     DE
+    LD      (HL), 0
+    LD      BC, 0x3F
+    LDIR
+    POP     BC
+    INC     H
+    LD      L, 0
+    DJNZ    GAP_CLEAR
+
+    ; Restore attributes for rows 0..9 to 0x44 (BRIGHT|INK_GREEN,
+    ; PAPER_BLACK). Pixels are now zero, so the area becomes black.
     LD      A, 0x44
+    CALL    FILL_TOP_ATTR
+
+    ; ATTR_T = 0x44 so RST 0x10 prints text in bright green on black
     LD      (0x5C8F), A
 
     CALL    TYPEWRITER      ; never returns: falls through to MAIN_ANIM
+
+; ============================================================
+; FILL_TOP_ATTR — fill rows 0..9 of the attribute area
+; (0x5800..0x593F, 320 B) with the byte in A.
+; ============================================================
+FILL_TOP_ATTR:
+    LD      HL, 0x5800
+    LD      DE, 0x5801
+    LD      (HL), A
+    LD      BC, 0x13F
+    LDIR
+    RET
 
 ; ============================================================
 ; TYPEWRITER — print MSG character by character with a blinking
