@@ -52,8 +52,6 @@ sudo apt install z80asm
 
 ### Emulator (for testing)
 - [JSSpeccy 3](https://jsspeccy.zxdemo.org/) — runs in the browser, easiest
-- [Fuse](https://fuse-emulator.sourceforge.net/) — desktop, macOS / Linux
-- ZEsarUX, ZXSpin, etc.
 
 ## Build
 
