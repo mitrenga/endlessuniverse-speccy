@@ -269,38 +269,65 @@ def convert_image(image_path):
     return bytes(screen)
 
 # ── TZX builder ───────────────────────────────────────────────────────────────
-def build_tzx(loader_bin, screen_data, basic, output_path):
-    """Assemble the BASIC + loader + screen blocks into a single TZX file."""
+ANIM_ORG  = 0xC200
+TABLE_ORG = 0xC800
+
+def build_tzx(stub_bin, anim_bin, screen_data, basic, output_path):
+    """Assemble the BASIC + stub + (image+anim) blocks into a single TZX file.
+
+    The stub loads at 0xC000, builds the address table at TABLE_ORG, then
+    runs SMLOADER on a single tape data block whose first `load_len` bytes
+    reveal into VRAM (image) and whose remaining bytes land at ANIM_ORG..
+    (animation/typewriter code). After SMLOADER, the stub jumps to ANIM_ORG.
+    """
     # Reorder VRAM bytes to match the Z80 GEN_TABLE sequence.
     ordered = order_vram_payload(screen_data, build_addr_table())
-    # Skip the top 8 strips (char rows 0..7, text overlay area) plus
-    # strips 8 and 9 (empty band above the image). The loader fills
-    # those attributes at run time, so they never travel on tape.
+    # Drop top 8 strips (text overlay area) + strips 8/9 (empty band).
     ordered = ordered[:14 * 288]
-    # Trim trailing zeros — the loader pre-clears VRAM, so any zero
-    # bytes at the end of the payload don't need to be transmitted.
+    # Trim trailing zeros (loader pre-clears VRAM via the gap-clear in anim).
     trimmed = ordered.rstrip(b'\x00')
     load_len = len(trimmed)
+    anim_len = len(anim_bin)
 
-    # Patch the loader's `LD DE, n` instruction with the actual payload
-    # length. Offset 0x0B is the opcode (0x11), 0x0C..0x0D is the operand.
-    assert loader_bin[0x0B] == 0x11, "LD DE offset mismatch — code.asm changed?"
-    patched = bytearray(loader_bin)
-    patched[0x0C] = load_len & 0xFF
-    patched[0x0D] = (load_len >> 8) & 0xFF
+    # Stub size sanity: must fit below ANIM_ORG, anim must fit below TABLE_ORG.
+    assert 0xC000 + len(stub_bin) <= ANIM_ORG, \
+        f"stub.bin {len(stub_bin)} B overflows ANIM_ORG=0x{ANIM_ORG:04X}"
+    assert ANIM_ORG + anim_len <= TABLE_ORG, \
+        f"anim.bin {anim_len} B overflows TABLE_ORG=0x{TABLE_ORG:04X}"
+
+    # Patch the three placeholders in the stub:
+    #   0x07-0x09: LD HL, TABLE+2*load_len   (where to start writing anim entries)
+    #   0x0D-0x0F: LD BC, anim_len            (count for the append loop)
+    #   0x1E-0x20: LD DE, load_len+anim_len   (total tape byte count)
+    assert stub_bin[0x07] == 0x21, "stub LD HL offset shifted — stub.asm changed?"
+    assert stub_bin[0x0D] == 0x01, "stub LD BC offset shifted — stub.asm changed?"
+    assert stub_bin[0x1E] == 0x11, "stub LD DE offset shifted — stub.asm changed?"
+    hl_val    = TABLE_ORG + 2 * load_len
+    total_len = load_len + anim_len
+    patched = bytearray(stub_bin)
+    patched[0x08] = hl_val   & 0xFF
+    patched[0x09] = (hl_val   >> 8) & 0xFF
+    patched[0x0E] = anim_len & 0xFF
+    patched[0x0F] = (anim_len >> 8) & 0xFF
+    patched[0x1F] = total_len & 0xFF
+    patched[0x20] = (total_len >> 8) & 0xFF
+
+    payload = trimmed + anim_bin
 
     tzx = b'ZXTape!\x1A' + bytes([1, 20])
     tzx += tzx_std(tape_header(0,'endless',len(basic),param1=10,param2=len(basic)), 1000)
     tzx += tzx_std(tape_data(basic), 1000)
     tzx += tzx_std(tape_header(3,'endless',len(patched),param1=0xC000), 1000)
     tzx += tzx_std(tape_data(bytes(patched)), 1000)
-    tzx += tzx_std(tape_data(trimmed), 2000)
+    tzx += tzx_std(tape_data(payload), 2000)
 
     with open(output_path, 'wb') as f:
         f.write(tzx)
     saved = 6912 - load_len
-    print(f"  Screen: {load_len} bytes ({saved} trailing zeros stripped)")
-    print(f"  TZX: {output_path} ({len(tzx)} bytes)")
+    print(f"  Image:   {load_len} B ({saved} trailing zeros stripped)")
+    print(f"  Anim:    {anim_len} B (loaded silently to 0x{ANIM_ORG:04X})")
+    print(f"  Payload: {len(payload)} B (image + anim, single tape block)")
+    print(f"  TZX:     {output_path} ({len(tzx)} bytes)")
 
 # ── WAV generator (physical Spectrum tape audio) ──────────────────────────────
 def tzx_to_wav(tzx_data, wav_path, sample_rate=44100):
@@ -378,12 +405,16 @@ def main():
 
     print("=== endless loader build ===")
 
-    # 1. Assemble loader
-    src_asm = os.path.join(SRC_DIR, 'code.asm')
-    out_bin = os.path.join(BUILD_DIR, 'code.bin')
-    print("\n[1] Assembling loader...")
-    assemble(src_asm, out_bin)
-    loader_bin = open(out_bin, 'rb').read()
+    # 1. Assemble stub (tape loader) and anim (typewriter + meteor/star)
+    print("\n[1] Assembling stub + anim...")
+    stub_asm = os.path.join(SRC_DIR, 'stub.asm')
+    stub_bin_path = os.path.join(BUILD_DIR, 'stub.bin')
+    assemble(stub_asm, stub_bin_path)
+    stub_bin = open(stub_bin_path, 'rb').read()
+    anim_asm = os.path.join(SRC_DIR, 'anim.asm')
+    anim_bin_path = os.path.join(BUILD_DIR, 'anim.bin')
+    assemble(anim_asm, anim_bin_path)
+    anim_bin = open(anim_bin_path, 'rb').read()
 
     # 2. Parse BASIC
     bas_src = os.path.join(SRC_DIR, 'loader.bas')
@@ -397,7 +428,7 @@ def main():
 
     # 4. Build TZX
     print("\n[4] Building TZX...")
-    build_tzx(loader_bin, screen_data, basic, args.output)
+    build_tzx(stub_bin, anim_bin, screen_data, basic, args.output)
 
     # 5. Generate WAV for physical Spectrum
     print("\n[5] Generating WAV for physical Spectrum...")
